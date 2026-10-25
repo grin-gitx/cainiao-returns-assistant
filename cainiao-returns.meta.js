@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         菜鸟销退单：从售后表逐单创建
 // @namespace    znext.local.cainiao-returns
-// @version      1.6.7
+// @version      1.6.8
 // @description  从售后表准备菜鸟小批导出，匹配未建售后并逐单创建销退单
 // @match        https://b.cainiao.com/business/import/perform/taobao-fulfillment/*
 // @grant        none

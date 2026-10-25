@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         菜鸟销退单：从售后表逐单创建
 // @namespace    znext.local.cainiao-returns
-// @version      1.6.7
+// @version      1.6.8
 // @description  从售后表准备菜鸟小批导出，匹配未建售后并逐单创建销退单
 // @match        https://b.cainiao.com/business/import/perform/taobao-fulfillment/*
 // @grant        none
@@ -39,6 +39,8 @@
     if (!current || current.id !== state.id || current.runToken !== state.runToken ||
         current.stage !== 'prep_files' || current.active) throw new Error('批次已变化，已丢弃旧文件读取结果');
   }
+  const ORIGINAL_WAIT_KEY = 'znext-cainiao-original-wait-v1';
+  const optimizedWait = (state) => state?.waitMode === 'observed-1.6.8';
   const PANEL_KEY = "znext-cainiao-returns-panel-open";
   // Conservative local settings; these are not Cainiao-published rate limits.
   const ACTION_INTERVAL_MS = 1500;
@@ -271,6 +273,7 @@
   }
 
   function pause(state, reason) {
+    timingStage(state, null);
     state.active = false;
     state.resumeStage = state.stage;
     state.stage = 'paused';
@@ -355,6 +358,101 @@
         selectedAddress('市') !== audit.city || selectedAddress('区') !== audit.district)) {
       throw new PauseError('本单市区地址发生变化，请人工核实');
     }
+  }
+
+  // This certificate is local DOM evidence, not a promise about future network activity.
+  // Any visible/event/DOM change discards the observation and uses the unchanged legacy path.
+  function readyFormSnapshot(state, expected) {
+    assertJobBinding(state, true);
+    const job = state.jobs[state.index], ids = createIdentifiers();
+    const lpInput = visibleAll('input[placeholder="请输入发货LP查询"]')[0];
+    const tables = visibleAll('table').filter((table) => table.innerText.includes('可退货数量'));
+    if (!ids || ids.order !== job.order || ids.lp !== state.lp || clean(lpInput?.value) !== state.lp ||
+        tables.length !== 1 || goodsBusy(tables[0])) return null;
+    const address = ['省', '市', '区'].map(addressControl), detail = addressDetail();
+    const carrierGroup = fieldGroup('退货物流商'), waybillGroup = fieldGroup('退货运单号');
+    const carrier = carrierGroup?.querySelector('[role="combobox"]'), waybill = waybillGroup?.querySelector('input');
+    const controls = [lpInput, ...address, detail, carrier, waybill];
+    if (controls.some((control) => !shown(control) || isDisabled(control) ||
+        control.closest('[aria-busy="true"], [aria-disabled="true"], [disabled]'))) return null;
+    const values = ['省', '市', '区'].map(selectedAddress);
+    const carrierValue = clean(carrier.getAttribute('aria-valuetext') || carrierGroup.querySelector('em')?.innerText || carrier.innerText);
+    if (values.some((value) => !value) || !clean(detail.value) || carrierValue !== '其他' || clean(waybill.value) !== job.waybill) return null;
+    const rows = [...tables[0].querySelectorAll('tbody tr')], selected = [], goods = [];
+    for (const row of rows) {
+      const cells = row.querySelectorAll('td'), check = row.querySelector('input[type="checkbox"]');
+      const quantity = row.querySelector('td[data-cn-next-table-col="5"] input');
+      goods.push(row, check, quantity, clean(row.innerText), check?.checked, quantity?.value, check?.disabled, quantity?.disabled);
+      if (!check?.checked) continue;
+      const count = Number(quantity?.value), shipped = Number(clean(cells[3]?.innerText)), available = Number(clean(cells[4]?.innerText));
+      if (isDisabled(check) || isDisabled(quantity) || !Number.isSafeInteger(count) || count <= 0 ||
+          !Number.isSafeInteger(shipped) || !Number.isSafeInteger(available) || count > shipped || count > available) return null;
+      selected.push({ goodsId: clean(cells[1]?.innerText), sku: clean(cells[2]?.innerText), quantity: count });
+    }
+    if (selected.length !== expected.length || expected.some((want) => selected.filter((got) =>
+      got.goodsId === want.goodsId && got.sku === want.sku && got.quantity === want.quantity).length !== 1)) return null;
+    const roots = [...new Set([...controls.map((control) => control.closest('.form-item') || control),
+      goodsContainer(tables[0]), ...visibleAll('.add-info-title')])];
+    return { roots, values, detail: detail.value, snapshot: [state.id, state.index, state.runToken, state.lp,
+      bindingSnapshot(job), mappingSnapshot(job), JSON.stringify(expected), location.href, tables[0], ...roots, ...controls,
+      ids.order, ids.lp, ...values, detail.value, carrierValue, waybill.value, ...goods] };
+  }
+
+  async function observeCompleteForm(state, expected) {
+    if (!optimizedWait(state)) return null;
+    const initial = readyFormSnapshot(state, expected);
+    // An incomplete/cascading form starts the original loading window immediately.
+    if (!initial) return null;
+    let changed = false, closed = false;
+    const relevant = (node) => initial.roots.some((root) => root === node || root.contains(node) || node.contains?.(root));
+    const inspect = (records) => {
+      if (records.some((record) => relevant(record.target) ||
+          [...record.addedNodes, ...record.removedNodes].some(relevant))) changed = true;
+    };
+    const observer = new MutationObserver(inspect);
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
+    const onInput = (event) => { if (relevant(event.target)) changed = true; };
+    document.addEventListener('input', onInput, true); document.addEventListener('change', onInput, true);
+    const close = () => {
+      if (closed) return; closed = true;
+      observer.disconnect(); document.removeEventListener('input', onInput, true); document.removeEventListener('change', onInput, true);
+    };
+    const valid = () => {
+      inspect(observer.takeRecords());
+      const current = readyFormSnapshot(state, expected);
+      return !closed && !changed && current && current.snapshot.length === initial.snapshot.length &&
+        current.snapshot.every((value, index) => value === initial.snapshot[index]);
+    };
+    try {
+      const since = Date.now();
+      while (Date.now() - since < 750) {
+        assertActive(state);
+        if (!valid()) { close(); return null; }
+        await sleep(Math.min(50, 750 - (Date.now() - since)));
+      }
+      assertActive(state);
+      if (!valid()) { close(); return null; }
+      const job = state.jobs[state.index];
+      state.addressAudit = { batchId: state.id, jobIndex: state.index, aftersale: job.aftersale,
+        province: initial.values[0], city: initial.values[1], district: initial.values[2], detail: initial.detail };
+      assertAddressPreserved(state); saveState(state);
+      return { valid, close };
+    } catch (error) { close(); throw error; }
+  }
+
+  // Local stage totals contain only elapsed time, stage and order position, never order data.
+  function timingStage(state, stage) {
+    if (!state.timing && !state.waitMode) return;
+    const timing = state.timing ||= { version: 1, totals: {}, segments: [], completed: 0 };
+    const now = Date.now(), prior = timing.current;
+    if (prior && prior.stage === stage && prior.index === state.index) return;
+    if (prior) {
+      const elapsedMs = Math.max(0, now - prior.since);
+      timing.totals[prior.stage] = (timing.totals[prior.stage] || 0) + elapsedMs;
+      timing.segments.push({ index: prior.index, stage: prior.stage, elapsedMs });
+    }
+    timing.current = stage ? { stage, index: state.index, since: now } : null;
+    timing.completed = state.index;
   }
 
   // Retain the existing helper name for callers; complete a missing city before its dependent district.
@@ -1623,7 +1721,9 @@
   async function next(state) {
     // A completed result must be advanced before inspecting the next page.
     assertRunning(state);
+    timingStage(state, null);
     state.index++;
+    if (state.timing) state.timing.completed = state.index;
     cleanJobTemporary(state);
     if (state.index >= (state.jobLimit ?? state.jobs.length)) {
       state.active = false;
@@ -1632,6 +1732,7 @@
       csvDownload(state);
     } else {
       state.stage = "cooldown";
+      timingStage(state, 'wait');
       state.notBefore = Date.now() + BETWEEN_ORDERS_MS;
       saveState(state);
       try {
@@ -1818,9 +1919,16 @@
     const waybill = await waitFor(() =>
       fieldGroup("退货运单号")?.querySelector("input"), "退货运单号", 20000, state);
     fill(waybill, job.waybill);
-    await completeDistrict(state);
-    // Controlled inputs may update after input/change handlers return.
-    await sleep(500); assertActive(state);
+    const certificate = await observeCompleteForm(state, expected);
+    let observed = false;
+    try { observed = !!certificate?.valid(); }
+    finally { certificate?.close(); }
+    if (!observed) {
+      await completeDistrict(state);
+      // Controlled inputs may update after input/change handlers return.
+      await sleep(500);
+    }
+    assertActive(state);
     assertAddressPreserved(state);
     if (state.dryRun) {
       auditCreateForm(state, expected, '核对未提交');
@@ -1849,6 +1957,7 @@
         previousRoms: [...new Set([...document.querySelectorAll('tbody tr')].map((row) => clean(row.querySelectorAll('td')[1]?.innerText))
           .concat((state.results || []).map((row) => clean(row[5]))).filter((id) => /^ROMS\d+$/.test(id)))] } };
     delete state.createConfirmationPending;
+    timingStage(state, 'receipt');
     state.stage = "verify";
     saveState(state);
     assertActive(state);
@@ -2333,6 +2442,10 @@
   async function runOwned(state) {
     try {
       assertActive(state);
+      if (state.flow !== 'prepare') {
+        timingStage(state, { create: 'form', verify: 'receipt', lookup: 'lookup', cooldown: 'wait' }[state.stage] || 'other');
+        if (state.timing) saveState(state);
+      }
       if (state.flow !== 'prepare' && recoverSubmission(state)) saveState(state);
       if (state.flow !== 'prepare' && state.stage !== 'done') assertJobBinding(state, state.stage !== 'verify');
       if (state.flow === 'prepare') await runPreparation(state);
@@ -2390,6 +2503,7 @@
     const start = panel.querySelector('[data-start]');
     const preparing = state?.flow === 'prepare';
     const inputMode = panel.querySelector('[data-input-mode]');
+    panel.querySelector('[data-original-wait]').disabled = busy || !!state?.active;
     const open = sessionStorage.getItem(PANEL_KEY) === "true";
     panel.querySelector('[data-body]').hidden = !open;
     panel.querySelector('[data-toggle]').textContent = open ? "收起" : state?.active
@@ -2434,6 +2548,13 @@
           ? state.dryRun ? '已核对第一单，未提交。记录已下载，正式处理请重新选择表格。'
             : `处理完毕：${batchOutcome(state).created} 已创建／${batchOutcome(state).deferred} 待人工处理／${batchOutcome(state).skipped} 人工跳过${batchOutcome(state).existing ? `／${batchOutcome(state).existing} 已建跳过` : ''}${batchOutcome(state).uncertain ? `／${batchOutcome(state).uncertain} 需核实` : ''}。仅统计本批任务；请下载处理记录，批次结束后处理待人工记录。`
           : "选拼多多售后表 → 准备菜鸟表格 → 选下载文件 → 匹配 → 开始创建。";
+    if (state?.timing) {
+      const labels = { form: '填写', receipt: '结果核对', lookup: '补查', wait: '单间等待', prepare: '准备', other: '其他' };
+      const totals = { ...state.timing.totals }, current = state.timing.current;
+      if (current) totals[current.stage] = (totals[current.stage] || 0) + Math.max(0, Date.now() - current.since);
+      status.textContent += `\n本批计时：已处理 ${state.index} 单；` + Object.entries(totals)
+        .map(([stage, ms]) => `${labels[stage] || stage} ${(ms / 1000).toFixed(1)} 秒`).join('，') + '（包含页面跳转等待）';
+    }
     if (state?.stage === 'prep_files') status.textContent += '\n本批导出已生成；点击图标仅为下载尝试。先检查浏览器实际文件，已保存可直接选择导入；未保存或被拦再按以下状态手动下载或仅允许菜鸟本站弹窗：\n' +
       (state.exports || []).map((task) => task.title + '（' + (task.downloadStatus || '下载结果未确认；等待实际文件核对') + '）').join('\n');
   }
@@ -2446,7 +2567,7 @@
     box.innerHTML = `
       <button data-toggle type="button" style="cursor:pointer;border:0;border-radius:10px;background:#1769df;color:white;padding:9px 12px;font:14px sans-serif">销退助手</button>
       <div data-body>
-      <div style="font-weight:bold;margin-top:8px;margin-bottom:8px">菜鸟销退单处理 1.6.7</div>
+      <div style="font-weight:bold;margin-top:8px;margin-bottom:8px">菜鸟销退单处理 1.6.8</div>
       <div data-status style="margin-bottom:10px;word-break:break-all"></div>
       <input data-file type="file" accept=".xlsx" multiple style="display:none">
       <input data-cainiao-file type="file" accept=".xlsx" multiple style="display:none">
@@ -2457,6 +2578,8 @@
       </select></label>
       <label style="display:block"><input data-dryrun type="checkbox"> 只核对一单，不提交</label>
       </div>
+      <label style="display:block;margin-bottom:8px"><input data-original-wait type="checkbox"> 使用原版等待节奏</label>
+      <div style="font-size:12px;margin-bottom:8px">仅空闲时可改，下次新选表格生效；当前批次继续使用原有设置。</div>
       <button data-choose type="button">选择三张表</button>
       <button data-prepare type="button">准备菜鸟表格</button>
       <button data-resume type="button">继续准备</button>
@@ -2468,6 +2591,12 @@
       </div>
     `;
     document.body.append(box);
+    const originalWait = box.querySelector('[data-original-wait]');
+    originalWait.checked = localStorage.getItem(ORIGINAL_WAIT_KEY) === 'true';
+    originalWait.addEventListener('change', () => {
+      if (busy || loadState()?.active) { originalWait.checked = localStorage.getItem(ORIGINAL_WAIT_KEY) === 'true'; return; }
+      localStorage.setItem(ORIGINAL_WAIT_KEY, String(originalWait.checked));
+    });
     box.querySelector('[data-toggle]').addEventListener('click', () => {
       sessionStorage.setItem(PANEL_KEY, String(sessionStorage.getItem(PANEL_KEY) !== 'true'));
       render();
@@ -2507,6 +2636,7 @@
       const start = box.querySelector('[data-start]');
       const dryRun = box.querySelector('[data-dryrun]');
       const selectedMode = inputMode.value;
+      const waitMode = originalWait.checked ? 'original-1.6.7' : 'observed-1.6.8';
       choose.disabled = true;
       start.disabled = true;
       inputMode.disabled = true;
@@ -2518,6 +2648,7 @@
         const state = selectedMode === 'prepare' ? plan : {
           ...plan, id: crypto.randomUUID(), index: 0, lp: '', stage: 'ready', active: false,
         };
+        state.waitMode = waitMode;
         sessionStorage.setItem(PANEL_KEY, 'true');
         saveState(state);
       } catch (error) {
@@ -2587,6 +2718,7 @@
       const state = loadState();
       if (state) {
         if (state.stage === "verify") record(state, "需人工核实", "用户在提交后停止处理，请核对后台结果");
+        timingStage(state, null);
         state.active = false;
         state.resumeStage = state.stage;
         state.stage = "stopped";
@@ -2597,8 +2729,14 @@
   }
 
   if (location.hostname === "localhost") window.__cainiaoReturnsTest = { readJobs };
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", panel, { once: true });
-  else panel();
-  const state = loadState();
-  if (state?.active) setTimeout(() => run(state), 800);
+  function startDocument() {
+    panel(); // Install controls/listeners before any optimized automatic continuation.
+    const state = loadState();
+    if (state?.active) {
+      if (optimizedWait(state)) run(state);
+      else setTimeout(() => run(state), 800);
+    }
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startDocument, { once: true });
+  else startDocument();
 })();
